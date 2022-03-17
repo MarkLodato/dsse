@@ -1,4 +1,8 @@
-r"""Reference implementation of signing-spec.
+r"""Proof-of-concept implementation of DSSE on top of COSE.
+
+This is effectively a minimal COSE implementation that conforms to the API of
+DSSE, namely requiring a single protected "content type" header. The encoding is
+CBOR for compatibility with COSE, though a JSON encoding is also possible.
 
 Copyright 2021 Google LLC.
 SPDX-License-Identifier: Apache-2.0
@@ -6,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 The following example requires `pip3 install pycryptodome` and uses ecdsa.py in
 the same directory as this file.
 
->>> import os, sys
+>>> import binascii, os, sys
 >>> from pprint import pprint
 >>> sys.path.insert(0, os.path.dirname(__file__))
 >>> import ecdsa
@@ -22,29 +26,28 @@ the same directory as this file.
 
 Signing example:
 
->>> signature_json = Sign(payloadType, payload, signer)
->>> pprint(json.loads(signature_json))
-{'payload': 'aGVsbG8gd29ybGQ=',
- 'payloadType': 'http://example.com/HelloWorld',
- 'signatures': [{'keyid': '66301bbf',
-                 'sig': 'A3JqsQGtVsJ2O2xqrI5IcnXip5GToJ3F+FnZ+O88SjtR6rDAajabZKciJTfUiHqJPcIAriEGAHTVeCUjW2JIZA=='}]}
+>>> signature_cbor = Sign(payloadType, payload, signer)
+>>> binascii.hexlify(signature_cbor)
+b'845821a103781d687474703a2f2f6578616d706c652e636f6d2f48656c6c6f576f726c64a04b68656c6c6f20776f726c64818340a1046836363330316262665840e21b0bbcbd129abfb39fba9026711a7521ce04d05449b9885a17230c6b6630f5e41c2770f3f01071de74ee3c7480a8cc011b1387840550f4c8ab333ac78434d7'
 
 Verification example:
 
->>> result = Verify(signature_json, [('mykey', verifier)])
+>>> result = Verify(signature_cbor, [('mykey', verifier)])
 >>> pprint(result)
 VerifiedPayload(payloadType='http://example.com/HelloWorld', payload=b'hello world', recognizedSigners=['mykey'])
 
 PAE:
 
->>> PAE(payloadType, payload)
-b'DSSEv1 29 http://example.com/HelloWorld 11 hello world'
+>>> sig_structure(payloadType, payload)
+b'\x85ISignaturex\x1dhttp://example.com/HelloWorld@@Khello world'
 """
 
-import base64, binascii, dataclasses, json, struct
+import binascii, dataclasses, io, struct
 
 # Protocol requires Python 3.8+.
 from typing import Iterable, List, Optional, Protocol, Tuple
+
+import cbor
 
 
 class Signer(Protocol):
@@ -78,54 +81,69 @@ class VerifiedPayload:
     recognizedSigners: List[str]  # List of names of signers
 
 
-def b64enc(m: bytes) -> str:
-    return base64.standard_b64encode(m).decode('utf-8')
+# COSE Common headers:
+ALG = 1
+CRIT = 2
+CONTENT_TYPE = 3
+KID = 4
+IV = 5
+PARTIAL_IV = 6
+COUNTER_SIGNATURE = 7
 
 
-def b64dec(m: str) -> bytes:
-    m = m.encode('utf-8')
-    try:
-        return base64.b64decode(m, validate=True)
-    except binascii.Error:
-        return base64.b64decode(m, altchars='-_', validate=True)
+def sig_structure(body_protected: bytes, payload: bytes) -> bytes:
+    return cbor.encode([
+        b'Signature',
+        body_protected,
+        b'',  # sign_protected
+        b'',  # external_aad
+        payload,
+    ])
 
 
-def PAE(payloadType: str, payload: bytes) -> bytes:
-    return b'DSSEv1 %d %b %d %b' % (
-            len(payloadType), payloadType.encode('utf-8'),
-            len(payload), payload)
+def Sign(payloadType: str, payload: bytes, signer: Signer) -> bytes:
+    body_protected = cbor.encode({CONTENT_TYPE: payloadType})
+    body_unprotected = {}
+    sign_protected = b''
+    sign_unprotected = {KID: signer.keyid()}
+    return cbor.encode([
+        body_protected, body_unprotected, payload,
+        [[
+            sign_protected,
+            sign_unprotected,
+            signer.sign(sig_structure(body_protected, payload)),
+        ]]
+    ])
 
 
-def Sign(payloadType: str, payload: bytes, signer: Signer) -> str:
-    signature = {
-        'keyid': signer.keyid(),
-        'sig': b64enc(signer.sign(PAE(payloadType, payload))),
-    }
-    if not signature['keyid']:
-        del signature['keyid']
-    return json.dumps({
-        'payload': b64enc(payload),
-        'payloadType': payloadType,
-        'signatures': [signature],
-    })
-
-
-def Verify(json_signature: str, verifiers: VerifierList) -> VerifiedPayload:
-    wrapper = json.loads(json_signature)
-    payloadType = wrapper['payloadType']
-    payload = b64dec(wrapper['payload'])
-    pae = PAE(payloadType, payload)
+def Verify(cbor_wrapper: bytes, verifiers: VerifierList) -> VerifiedPayload:
+    wrapper = cbor.decode(cbor_wrapper)
+    if not isinstance(wrapper, list) or len(wrapper) != 4:
+        raise ValueError('Expected array of length 4: %r' % wrapper)
+    body_protected, body_unprotected, payload, signatures = wrapper
+    # TODO: check types
+    to_be_signed = sig_structure(body_protected, payload)
     recognizedSigners = []
-    for signature in wrapper['signatures']:
+    for signature in signatures:
+        sign_protected, sign_unprotected, sig = signature
+        if sign_protected:
+            raise ValueError('sign_protected expected to be empty')
+        keyid = sign_unprotected.get('keyid')
+        # TODO check types
         for name, verifier in verifiers:
-            if (signature.get('keyid') is not None and
-                verifier.keyid() is not None and
-                signature.get('keyid') != verifier.keyid()):
+            if (keyid is not None and verifier.keyid() is not None
+                    and keyid != verifier.keyid()):
                 continue
-            if verifier.verify(pae, b64dec(signature['sig'])):
+            if verifier.verify(to_be_signed, sig):
                 recognizedSigners.append(name)
     if not recognizedSigners:
         raise ValueError('No valid signature found')
+    headers = cbor.decode(body_protected)
+    # TODO check types
+    if len(headers) != 1 or CONTENT_TYPE not in headers:
+        raise ValueError('Expected exactly one protected header (%d), got %r' %
+                         (CONTENT_TYPE, headers))
+    payloadType = headers[CONTENT_TYPE]
     return VerifiedPayload(payloadType, payload, recognizedSigners)
 
 
